@@ -1,6 +1,8 @@
 import asyncio
 import os
+import sys
 import warnings
+from pathlib import Path
 
 import ccxt.async_support as ccxt
 import joblib
@@ -15,15 +17,56 @@ from src.risk.manager import RiskManager
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 # ============================================================
-# РЕЖИМ ТЕСТИРОВАНИЯ
-# True  → режим B: ослабленные условия (проверка механики)
-# False → режим A: строгие условия (реальная торговля)
+# НАСТРОЙКА ЛОГИРОВАНИЯ
 # ============================================================
-TEST_MODE = False
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+# Убираем дефолтный sink (stderr), чтобы контролировать формат
+logger.remove()
+
+# 1. Консоль — только INFO и выше, компактный формат
+logger.add(
+    sys.stderr,
+    level="INFO",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+           "<level>{level: <8}</level> | <level>{message}</level>",
+    colorize=True,
+)
+
+# 2. Основной файл — всё (DEBUG+), ротация по дням, храним 30 дней
+logger.add(
+    LOG_DIR / "bot_{time:YYYY-MM-DD}.log",
+    level="DEBUG",
+    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
+           "{name}:{function}:{line} | {message}",
+    rotation="00:00",       # новый файл в полночь
+    retention="30 days",    # храним 30 дней
+    compression="zip",      # старые сжимаем в zip
+    encoding="utf-8",
+    enqueue=True,           # безопасно для async
+)
+
+# 3. Файл только для сделок — для быстрого анализа PnL
+logger.add(
+    LOG_DIR / "trades_{time:YYYY-MM-DD}.log",
+    level="SUCCESS",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {message}",
+    rotation="00:00",
+    retention="90 days",    # сделки храним дольше
+    compression="zip",
+    encoding="utf-8",
+    filter=lambda record: "[TRADE]" in record["message"],
+    enqueue=True,
+)
+
+# ============================================================
+# РЕЖИМ ТЕСТИРОВАНИЯ
+# ============================================================
+TEST_MODE = False  # A — строгие условия (реальная торговля)
 
 
 async def load_regime_filter(exchange, symbol: str) -> pd.DataFrame:
-    """Загружает 1d данные и считает SMA200 для фильтра режима."""
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, "1d", limit=250)
         df = pd.DataFrame(
@@ -46,6 +89,7 @@ async def main():
     logger.info(
         f"MODE: {'B — TEST (loose thresholds)' if TEST_MODE else 'A — STRICT'}"
     )
+    logger.info(f"Logs dir: {LOG_DIR.resolve()}")
 
     exchange = getattr(ccxt, Config.EXCHANGE_ID)({"enableRateLimit": True})
 
@@ -105,17 +149,15 @@ async def main():
             proba = model.predict_proba(X)[0]
             price = last["close"]
 
-            # ---- Генерация сигнала: зависит от режима ----
+            # ---- Генерация сигнала ----
             signal = "HOLD"
 
             if TEST_MODE:
-                # Режим B: ослабленные условия — быстро проверить механику
                 if pred == 1 and proba[1] > 0.50 and regime_bull == 1:
                     signal = "BUY"
                 elif pred == 0 and proba[0] > 0.50:
                     signal = "SELL"
             else:
-                # Режим A: строгие условия — реальная торговля
                 if (
                     pred == 1
                     and proba[1] > 0.58
@@ -126,8 +168,13 @@ async def main():
                 elif pred == 0 and proba[0] > 0.58:
                     signal = "SELL"
 
+            # Не спамим SELL, если позиции нет
+            log_signal = signal
+            if signal == "SELL" and position == 0:
+                log_signal = "HOLD"
+
             logger.info(
-                f"Price: {price:.2f} | Signal: {signal} | "
+                f"Price: {price:.2f} | Signal: {log_signal} | "
                 f"P(up)={proba[1]:.2f} | trend_4h={last['trend_4h']} | "
                 f"regime={'BULL' if regime_bull else 'BEAR'} | Pos: {position}"
             )
@@ -138,7 +185,10 @@ async def main():
                 if order:
                     position = order["amount"]
                     entry_price = price
-                    logger.success(f"[PAPER] BUY {position:.4f} @ {price}")
+                    logger.success(
+                        f"[TRADE] BUY {position:.4f} {Config.SYMBOL} @ {price:.2f} "
+                        f"(P(up)={proba[1]:.2f})"
+                    )
                     db = SessionLocal()
                     db.add(
                         Trade(
@@ -153,8 +203,10 @@ async def main():
 
             elif signal == "SELL" and position > 0:
                 pnl = (price - entry_price) * position
+                pnl_pct = (price / entry_price - 1) * 100
                 logger.success(
-                    f"[PAPER] SELL {position:.4f} @ {price}. PnL: ${pnl:.2f}"
+                    f"[TRADE] SELL {position:.4f} {Config.SYMBOL} @ {price:.2f} | "
+                    f"PnL=${pnl:+.2f} ({pnl_pct:+.2f}%)"
                 )
                 db = SessionLocal()
                 db.add(
